@@ -109,6 +109,9 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -118,7 +121,8 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Deploy and smoke-test staging
+      - name: Deploy staging
+        id: deploy
         env:
           SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}-staging
           RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
@@ -137,7 +141,25 @@ jobs:
             --region "${{ vars.GCP_REGION }}" \
             --format='value(status.url)')"
           echo "Staging URL: $SERVICE_URL"
-          ID_TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          echo "service_url=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Generate staging identity token
+        id: smoke-auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_STAGING_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_STAGING_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.deploy.outputs.service_url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Smoke-test staging
+        env:
+          SERVICE_URL: ${{ steps.deploy.outputs.service_url }}
+          ID_TOKEN: ${{ steps.smoke-auth.outputs.id_token }}
+        run: |
           curl --fail --retry 5 --retry-delay 2 --retry-all-errors \
             -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/health"
 
@@ -152,6 +174,9 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -161,7 +186,8 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Deploy and smoke-test production
+      - name: Deploy production
+        id: deploy
         env:
           SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
           RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
@@ -180,6 +206,24 @@ jobs:
             --region "${{ vars.GCP_REGION }}" \
             --format='value(status.url)')"
           echo "Production URL: $SERVICE_URL"
-          ID_TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          echo "service_url=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Generate production identity token
+        id: smoke-auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_PRODUCTION_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PRODUCTION_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.deploy.outputs.service_url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Smoke-test production
+        env:
+          SERVICE_URL: ${{ steps.deploy.outputs.service_url }}
+          ID_TOKEN: ${{ steps.smoke-auth.outputs.id_token }}
+        run: |
           curl --fail --retry 5 --retry-delay 2 --retry-all-errors \
             -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/health"
