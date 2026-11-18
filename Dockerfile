@@ -23,14 +23,15 @@ COPY app /app/app
 
 ENV PATH="/opt/venv/bin:$PATH"
 ENV ENVIRONMENT="production"
+ENV PORT=8080
 
 # Switch to non-root user
 USER appuser
 
-EXPOSE 8000
+EXPOSE 8080
 
 # Healthcheck for container orchestration
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:8000/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider "http://localhost:${PORT:-8080}/health" || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

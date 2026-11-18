@@ -5,3 +5,5 @@ __pycache__/
 .coverage
 junit/
 Task_*.md
+deploy_key
+deploy_key.pub

@@ -1,119 +1,182 @@
-name: TechCorp DevOps CI/CD Pipeline
+name: TechCorp FastAPI CI/CD
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/techcorp-api:${{ github.sha }}
 
 jobs:
-  # ============================================================
-  # CONTINUOUS INTEGRATION (CI) STAGE
-  # ============================================================
   continuous-integration:
-    name: Build, Test, and Scan
+    name: Test and scan
     runs-on: ubuntu-latest
-    
-    # Preconditions: Triggered by PR or push to main branch
     steps:
-      - name: Checkout Source Code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.13
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: "pip"
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
-      # Automated Activity: Unit and Integration Testing
-      - name: Run PyTest
+      - name: Run tests
         run: |
-          pytest tests/ --doctest-modules --junitxml=junit/test-results.xml
+          mkdir -p junit
+          pytest -q tests/ \
+            --junitxml=junit/test-results.xml \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml
 
-      # Automated Activity: Static Application Security Testing (SAST)
-      - name: Security Vulnerability Scan (Trivy)
-        uses: aquasecurity/trivy-action@master
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'table'
-          exit-code: '1'
+          name: junit-results
+          path: |
+            junit/test-results.xml
+            coverage.xml
+          if-no-files-found: ignore
+
+      - name: Scan dependencies and source with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: "1"
           ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
 
-  # ============================================================
-  # CONTINUOUS DELIVERY (CD) STAGE
-  # ============================================================
-  continuous-delivery:
-    name: Containerize and Publish
+  publish-image:
+    name: Build and publish image
     runs-on: ubuntu-latest
-    # Preconditions: CI Stage must pass completely
     needs: continuous-integration
-    if: github.ref == 'refs/heads/main'
-
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: Checkout Source Code
+      - name: Checkout source
         uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_BUILD_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BUILD_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Artifact Registry authentication
+        run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Simulated Registry Login (using GitHub Packages for reality)
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Automated Activity: Build and Push Docker Image
-      - name: Build and Push Container Image
-        uses: docker/build-push-action@v5
+      - name: Build and push immutable image
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}/techcorp-api:${{ github.sha }},ghcr.io/${{ github.repository }}/techcorp-api:latest
+          tags: ${{ env.IMAGE }}
 
-  # ============================================================
-  # CONTINUOUS DEPLOYMENT (CD) STAGE
-  # ============================================================
-  continuous-deployment-staging:
-    name: Deploy to Staging Environment
+  deploy-staging:
+    name: Deploy to Cloud Run staging
     runs-on: ubuntu-latest
-    # Preconditions: CDel stage must complete successfully
-    needs: continuous-delivery
+    needs: publish-image
     environment:
       name: staging
-      url: https://staging.techcorp.local
-
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: Deploy to Staging
-        run: |
-          echo "Pulling image ghcr.io/${{ github.repository }}/techcorp-api:${{ github.sha }}"
-          echo "Simulating zero-downtime deployment to Staging Kubernetes Cluster..."
-          echo "Deployment successful."
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_STAGING_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_STAGING_SERVICE_ACCOUNT }}
 
-  continuous-deployment-production:
-    name: Deploy to Production Environment
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy and smoke-test staging
+        env:
+          SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}-staging
+          RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --image "$IMAGE" \
+            --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --platform managed \
+            --min 0 \
+            --max 1 \
+            --quiet
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+          echo "Staging URL: $SERVICE_URL"
+          ID_TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          curl --fail --retry 5 --retry-delay 2 --retry-all-errors \
+            -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/health"
+
+  deploy-production:
+    name: Deploy to Cloud Run production
     runs-on: ubuntu-latest
-    # Preconditions: Staging deployment successful AND Human Approval required
-    needs: continuous-deployment-staging
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment:
       name: production
-      url: https://api.techcorp.local
-    
-    # Human Decision Gate: GitHub Environments handles the approval pause here
-
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: Deploy to Production
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_PRODUCTION_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PRODUCTION_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy and smoke-test production
+        env:
+          SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
         run: |
-          echo "Executing Production Deployment after Manual Approval..."
-          echo "Pulling verified image ghcr.io/${{ github.repository }}/techcorp-api:${{ github.sha }}"
-          echo "Deploying to Production Cluster..."
-          echo "Deployment complete."
+          gcloud run deploy "$SERVICE" \
+            --image "$IMAGE" \
+            --service-account "$RUNTIME_SERVICE_ACCOUNT" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --platform managed \
+            --min 0 \
+            --max 1 \
+            --quiet
+          SERVICE_URL="$(gcloud run services describe "$SERVICE" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+          echo "Production URL: $SERVICE_URL"
+          ID_TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          curl --fail --retry 5 --retry-delay 2 --retry-all-errors \
+            -H "Authorization: Bearer $ID_TOKEN" "$SERVICE_URL/health"
